@@ -1,180 +1,215 @@
-# coding=utf-8
-from xbmc import log, LOGERROR, LOGDEBUG
-import requests
+import xbmc
+import xbmcaddon
 import json
-from urllib.parse import urlencode
 import hashlib
-import time
+from numbers import Number 	# to check whether a certain variable is numeric
+from .loginfailedexception import LoginFailedException
+import os
+import operator # it's for use sort with operator
+import sys
+import re
+from datetime import date
+if sys.version_info.major >= 3:
+	# Python 3 stuff
+	from urllib.parse import urlparse, urlencode
+	from urllib.request import urlopen, Request, build_opener
+	from urllib.error import HTTPError
+else:
+	# Python 2 stuff
+	from urlparse import urlparse
+	from urllib import urlencode
+	from urllib2 import urlopen, Request, HTTPError, build_opener
 
-class pCloudAPI :
+class PCloudApi:
+
 	def __init__(self):
-		self.sess = requests.Session()
-		self.apiLocation = 'api.pcloud.com'
-		self.TOKEN_EXPIRATION_SECONDS = 1200
+		# auth typically comes from xbmcaddon.Addon() followed by myAddon.getSetting("auth")
 		self.auth = None
-		self.http_errors = 0
-		self.last_error = ''
+		self.PCLOUD_BASE_URL = xbmcaddon.Addon().getSetting("pcloudApiUrl")
+		if self.PCLOUD_BASE_URL is None:
+			self.PCLOUD_BASE_URL = "https://api.pcloud.com/"
+		xbmc.log ('self.PCLOUD_BASE_URL is {}'.format(self.PCLOUD_BASE_URL ))
+		self.TOKEN_EXPIRATION_SECONDS = 100 * 86400 # 100 days
+		self.HttpHandler = build_opener()
+		self.HttpHandler.addheaders = [('Accept', 'application/json')]
+		self.errorCodeMapping = {
+			1000: "Log in required.",
+			1002: "No full path or folderid provided.",
+			1004: "No fileid or path provided.",
+			1076: "Please provide 'tokenid'.",
+			2000: "Log in failed.",
+			2002: "A component of parent directory does not exist.",
+			2003: "Access denied. You do not have permissions to perform this operation.",
+			2005: "Directory does not exist.",
+			2009: "File not found.",
+			2010: "Invalid path.",
+			2102: "Provided 'tokenid' not found.",
+			4000: "Too many login tries from this IP address.",
+			5000: "Internal error. Try again later."
 
-	def Kill(self):
-		self.sess.close()
+		}
 
-	def BuildAPIInitialPath(self):
-		return 'https://' + self.apiLocation + '/'
-	def BuildAPICommandPath(self, command, params, isGet = True):
-		if params is not None:
-			if isGet:
-				return self.BuildAPIInitialPath() + command + '?' + params
-			else:
-				return self.BuildAPIInitialPath() + command
-		else:
-			return self.BuildAPIInitialPath() + command
+	def CheckIfAuthPresent(self):
+		if self.auth is None or self.auth == "":
+			raise Exception ("Auth not present. Call PerformLogon() or SetAuth() first.")
+
 	def GetErrorMessage(self, errorCode):
-		return ""	#TODO
-	
-	def ExecuteRequest(self, apiMethod, paramsUrlEncoded, isGet = True):
-		# Build the URL and, then, execute the request
-		url = self.BuildAPICommandPath(apiMethod, paramsUrlEncoded, isGet = isGet)
-		
+		errMsg = self.errorCodeMapping.get(errorCode, "Unknown error")
+		return errMsg
+
+	def SetAuth(self, auth):
+		self.auth = auth
+
+	def ExecuteRequest(self, api, data = None):
+		"""
+		Private method to execute a JSON request and return its results raw.
+		"""
+		url = '{0}{1}'.format(self.PCLOUD_BASE_URL, api)
+		xbmc.log ('Calling {0}...'.format(url))
+		requestData = {}
+		requestHeaders = {}
+		method = 'GET'
+		if data is not None:
+			requestData = data.encode('utf-8')
+			method = 'POST'
 		try:
-			if isGet:
-				response = self.sess.get(url, timeout = 30)
+			if sys.version_info.major >= 3:
+				# Python 3 stuff
+				httpRequest = Request(
+					url,
+					data=requestData,
+					method=method)
 			else:
-				if paramsUrlEncoded != None:
-					response = self.sess.post(url, timeout = 30, data = paramsUrlEncoded)
-				else:
-					response = self.sess.post(url, timeout = 30)
-			log('plugin.video.pcloud-video-streaming: ' + response.url, LOGDEBUG)
-			if response.status_code != 200:
-				self.http_errors += 1
-				self.last_error = 'HTTP-%d' % response.status_code
-				return dict(result=7000, error='HTTP-%d' % response.status_code)
-			
-			return json.loads(response.text)
+				# Python 2 stuff. Request for Python 2 (at least on Android) does not
+				# support the "method" keyword.
+				httpRequest = Request(
+					url,
+					data=requestData)
+			response = self.HttpHandler.open(httpRequest)
+			responseStr = response.read().decode('utf-8')
+			self.HttpHandler.close()
+			result = json.loads(responseStr)
+			return result
 		except Exception as e:
-			self.http_errors += 1
-			self.last_error = str(e)
-			log('plugin.video.pcloud-video-streaming: !!! Error calling ' + apiMethod + ': ' + str(e), LOGERROR)
-			return dict(result=7000, error=str(e))
+			xbmc.log('ExecuteRequest FAILED: {}'.format(str(e)), xbmc.LOGERROR)
+			raise
 
-	def CheckIfAuthPresent(self, forceReAutenticate = False):
-		# Check if auth token is still valid, otherwise re-authenticate
-		if self.auth is None:
-			self.auth = self.Logon(forceReAutenticate)
-		else:
-			authAge = time.time() - self.auth["authtime"]
-			if forceReAutenticate or (self.TOKEN_EXPIRATION_SECONDS < authAge):
-				self.auth = self.Logon(forceReAutenticate)
-
-	# Performs the two-step authentication. Returns an auth token
-	def Logon(self, forceReAutenticate=False):
-		username = self.addon.getSetting('pcloud_username')
-		password = self.addon.getSetting('pcloud_password')
-		# If the password has been saved, it has been encrypted and must be decrypted
-		if password == 'NO_PASSWORD_SAVED':
-			password = ''
-		else:
-			password = self.EncryptionDecryption(password)
-		if self.auth is None or forceReAutenticate is True:
-			# Parameters needed by the getdigest API call
-			digestParams = urlencode({ "getauth": 1, "logout": 1, "username": username })
-			response = self.ExecuteRequest('getdigest', digestParams)
-			if response["result"]:
-				raise Exception("Error calling getdigest: " + self.GetErrorMessage(response["result"]))
-			log('plugin.video.pcloud-video-streaming: getdigest response is: ' + str(response), LOGDEBUG)
-			# Response contains digest, necessary for the second step and for token exchange.
-			# Compute password's SHA-1
-			passwordDigest = hashlib.sha1((password + str.encode(self.addon.getSetting('pcloud_username'))) \
-				+ str.encode(response['digest'])).hexdigest()
-
-			# Kodi 21 Omega fix (June 2026): pCloud deprecated the 'userinfo' endpoint
-			# for digest-based authentication. The endpoint no longer returns an auth token.
-			# Switching to the 'login' endpoint which correctly returns an auth token.
-			# Also removed the 'logout=1' parameter which prematurely invalidated sessions.
-			authApi = 'login'
-			params = { "getauth": 1, "username": username, "digest": response["digest"],
-						"authexpire": str(self.TOKEN_EXPIRATION_SECONDS), "passworddigest": passwordDigest }
-			paramsUrlEncoded = urlencode(params)
-			response = self.ExecuteRequest(authApi, paramsUrlEncoded)
-			if response["result"]:
-				errorMessage = self.GetErrorMessage(response["result"])
-				raise Exception("Error calling login: " + errorMessage)
-			self.auth = response["auth"]
-			return self.auth
+	def PerformLogon(self, username, password):
+		""" This must be the first API that gets called after the constructor.
+			Uses pCloud digest-based authentication: getdigest → login.
+			Returns auth token.
+		"""
+		api = "getdigest"
+		response = self.ExecuteRequest(api)
+		if response["result"]:
+			errorMessage = self.GetErrorMessage(response["result"])
+			raise Exception("Error calling getdigest: " + errorMessage)
+		sha1 = hashlib.sha1()
+		sha1.update(username.encode('utf-8'))
+		usernameDigest = sha1.hexdigest()
+		sha1 = hashlib.sha1()
+		sha1.update(password.encode('utf-8') + usernameDigest.encode('utf-8') + response["digest"].encode('utf-8'))
+		passwordDigest = sha1.hexdigest()
+		# Use the 'login' endpoint (not 'userinfo') — as of 2026, only 'login'
+		# returns the auth token via digest-based authentication.
+		authApi = 'login'
+		params = { "getauth": 1, "username": username, "digest": response["digest"],
+					"authexpire": str(self.TOKEN_EXPIRATION_SECONDS), "passworddigest": passwordDigest }
+		paramsUrlEncoded = urlencode(params)
+		response = self.ExecuteRequest(authApi, paramsUrlEncoded)
+		if response["result"]:
+			errorMessage = self.GetErrorMessage(response["result"])
+			raise Exception("Error calling login: " + errorMessage)
+		self.auth = response["auth"]
+		return self.auth
 
 	def ListFolderContents(self, folderNameOrID, isMyShares = False):
 		self.CheckIfAuthPresent()
 		tryAgain = True
-		while (tryAgain):
-			tryAgain = False
-			# TODO: parametrize or globablise MAXRETRIES
-			if isinstance(folderNameOrID, int):
-				params = urlencode({ "folderid": folderNameOrID, "auth": self.auth["auth"] })
-			else:
-				params = urlencode({ "path": folderNameOrID, "auth": self.auth["auth"] })
-			if isMyShares:
-				#Special functions for shared items
-				response = self.ExecuteRequest('listshares', params)
-			else:
-				response = self.ExecuteRequest('listfolder', params)
-			if response["result"] == 0:
-				if 'metadata' in response:
-					return response["metadata"]["contents"]
+		while tryAgain:
+			if not isMyShares:
+				# This is for regular folders, i.e. anything else than the "My Shares" folder
+				url = "listfolder?auth=" + self.auth
+				if isinstance (folderNameOrID, Number):
+					url += "&folderid=" + str(folderNameOrID) # string coercion
 				else:
-					return []
-			elif response["result"] == 1004:   #Token expired mid-session
-				self.auth = self.Logon(True)
-				tryAgain = True
+					url += "&path=" + folderNameOrID
 			else:
-				raise Exception("Error calling listfolder: " + self.GetErrorMessage(response["result"]))
+				# This is ONLY for the "My Shares" folder
+				url = "listpublinks?auth=" + self.auth
+			response = self.ExecuteRequest(url)
+			errCode = response["result"]
+			if errCode == 2005: # directory does not exist
+				folderNameOrID = 0
+				tryAgain = True # try again on the root directory
+			elif errCode == 2000: # Log in failed. Perhaps old token?
+				raise LoginFailedException("Error: Log in failed (2000)")
+				tryAgain = False
+			else:
+				tryAgain = False
+				if errCode != 0:
+					errorMessage = self.GetErrorMessage(errCode)
+					raise Exception("Error calling listfolder or listpublinks: {0} ({1})".format(errorMessage, errCode))
+				# We will sort contents by name
+				elif not isMyShares:
+					response["metadata"]["contents"].sort(key=operator.itemgetter('name'))
+		return response
 
-	def GetFileLink(self, fileNameOrID, isMyShares = False):
-		link = None
-		log('plugin.video.pcloud-video-streaming: getting link to {}'.format(fileNameOrID), LOGDEBUG)
+	def GetStreamingUrl(self, fileID):
 		self.CheckIfAuthPresent()
-		for retry in range(2):
-			if isinstance(fileNameOrID, int):
-				params = urlencode({ "fileid": fileNameOrID, "auth": self.auth["auth"], "skipfilename": "1" })
-			else:
-				params = urlencode({ "path": fileNameOrID, "auth": self.auth["auth"], "skipfilename": "1" })
-			response = self.ExecuteRequest('getfilelink', params)
-			if response["result"] == 0:
-				try:
-					link = "https://" + response["hosts"][0] + response["path"]
-				except:
-					raise Exception("Malformed response from getfilelink")
-			elif response["result"] == 1004:
-				raise Exception("Token expired — can't retry")
-				self.auth = self.Logon(True)
-				continue
-			elif response["result"] == 7000 or response["result"] == 5000:
-				if retry == 0:
-					continue
-			else:
-				raise Exception("Error calling getfilelink: " + self.GetErrorMessage(response["result"]))
-			break
-		return link
+		url = "getfilelink?auth=" + self.auth + "&fileid=" + str(fileID)
+		response = self.ExecuteRequest(url)
+		if response["result"]:
+			errorMessage = self.GetErrorMessage(response["result"])
+			raise Exception("Error calling getfilelink: " + errorMessage)
+		streamingUrl = "https://%s%s" % (response["hosts"][0], response["path"])
+		return streamingUrl
 
-	def GetThumbnailLinks(self, folderOrFileID, isMyShares = False):
-		links = []
-		log('plugin.video.pcloud-video-streaming: getting thumbnail links', LOGDEBUG)
+	def GetThumbnails (self, fileIDSequence):
 		self.CheckIfAuthPresent()
-		if isinstance(folderOrFileID, int):
-			params = urlencode({ "fileid": folderOrFileID, "auth": self.auth["auth"] })
-		else:
-			params = urlencode({ "path": folderOrFileID, "auth": self.auth["auth"] })
-		response = self.ExecuteRequest('getthumbslinks', params)
-		if response["result"] == 0:
-			for thumb in response["thumbslinks"]["thumbs"]:
-				links.append("https://" + thumb["hosts"][0] + thumb["path"])
-		elif response["result"] == 1004:
-			raise Exception("Token expired — can't retry")
-			self.auth = self.Logon(True)
-		else:
-			raise Exception("Error calling getthumbslinks: " + self.GetErrorMessage(response["result"]))
-		return links
+		commaSeparated = ",".join(str(oneFileID) for oneFileID in fileIDSequence) # coerce to string before comma-joining
+		url = "getthumbslinks"
+		# Here we use POST instead of GET in order to account for folders with lots of files
+		params = { "auth": self.auth, "fileids": commaSeparated, "size": "256x256", "format": "png" }
+		paramsUrlEncoded = urlencode(params)
+		response = self.ExecuteRequest(url, paramsUrlEncoded)
+		if response["result"]:
+			errorMessage = self.GetErrorMessage(response["result"])
+			raise Exception("Error calling getthumbslinks: " + errorMessage)
+		# Turn it into a dictionary indexed by file ID, the value being the thumbnail URL
+		thumbs = dict()
+		for oneThumb in response["thumbs"]:
+			if oneThumb["result"] == 0:
+				thumbs[oneThumb["fileid"]] = "https://{0}{1}".format(oneThumb["hosts"][0], oneThumb["path"])
+		return thumbs
 
-	def EncryptionDecryption(self, input):
-		key = self.addon.getSetting('') #Empty uuid
-		key = ''.join(chr(ord(c) % 16 + 48) for c in key) if key else '0000' #Fallback
-		key = hashlib.sha256(key.encode()).hexdigest()[:48]
-		return ''.join(chr(ord(c) ^ ord(k)) for c, k in zip(input, key))
+	def DeleteFile(self, fileID):
+		self.CheckIfAuthPresent()
+		url = "deletefile?auth=" + self.auth + "&fileid=" + str(fileID)
+		response = self.ExecuteRequest(url)
+		if response["result"]:
+			errorMessage = self.GetErrorMessage(response["result"])
+			raise Exception("Error calling deletefile: " + errorMessage)
+
+	def DeleteFolder(self, folderID):
+		self.CheckIfAuthPresent()
+		url = self.PCLOUD_BASE_URL + "deletefolderrecursive?auth=" + self.auth + "&folderid=" + str(folderID)
+		response = self.ExecuteRequest(url)
+		if response["result"]:
+			errorMessage = self.GetErrorMessage(response["result"])
+			raise Exception("Error calling deletefolderrecursive: " + errorMessage)
+
+	def translateDate(self, dateInPCloudFormat):
+		""" Translates a date from the PCloud format ("Thu, 19 Sep 2013 07:31:46 +0000") to
+		the Kodi format ("19.09.2013")
+		"""
+		match = re.search("^[A-Za-z]{3}, (\d{1,2}) ([A-Za-z]{3}) (\d{4})", dateInPCloudFormat)
+		if match is None or match.lastindex < 3:
+			return date.today().strftime("%d.%m.%Y")
+		# Group 1 is the day, group 2 is the month abbreviation, group 3 is the year
+		day = int(match.group(1))
+		monthDict = { "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+			"Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12  }
+		month = monthDict[match.group(2)]
+		year = int(match.group(3))
+		return date(year, month, day).strftime("%d.%m.%Y")
